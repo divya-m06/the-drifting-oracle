@@ -1,6 +1,15 @@
 """
-German Credit — XGBoost (Champion) vs SVM (Challenger) + PSI-Triggered Model Switching
-Uses RandomizedSearchCV + feature engineering to maximize accuracy.
+German Credit — XGBoost (Champion) vs SDG (Challenger) + PSI-Triggered Model Switching
+
+Pipeline:
+  1. Load + preprocess German Credit data
+  2. Load PSI drift results from drift_detection.py
+  3. Train XGBoost (champion) on original German Credit data
+  4. If PSI >= 0.2 (drift detected):
+     - Apply same economic shock to German Credit training data
+     - Retrain SDG (challenger) on drifted training data
+     - Select challenger for deployment
+  5. If PSI < 0.2: champion stays, no retraining needed
 """
 
 import pandas as pd
@@ -8,15 +17,13 @@ import numpy as np
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.metrics import roc_auc_score, f1_score, classification_report
+from sklearn.metrics import roc_auc_score, f1_score, classification_report, accuracy_score
 from xgboost import XGBClassifier
-import pickle
 import warnings
 warnings.filterwarnings("ignore")
 
-GERMAN_PATH         = "data/german_data.csv"
+GERMAN_PATH = "data/german_data.csv"
 PSI_DRIFT_THRESHOLD = 0.2
-AGREE_THRESHOLD     = 0.90
 
 CATEGORICAL_COLS = [
     "checking_status", "credit_history", "purpose", "savings_status",
@@ -26,36 +33,39 @@ CATEGORICAL_COLS = [
 
 
 def find_best_threshold(y_true, y_proba):
-    """Scan thresholds 0.1–0.9, return the one with best accuracy."""
-    best_thresh, best_acc = 0.5, 0.0
+    """Scan thresholds 0.1-0.9, return the one with best F1."""
+    best_thresh, best_f1 = 0.5, 0.0
+    from sklearn.metrics import f1_score
     for t in np.arange(0.1, 0.9, 0.01):
         preds = (y_proba >= t).astype(int)
-        acc = (preds == y_true).mean()
-        if acc > best_acc:
-            best_acc = acc
+        f1 = f1_score(y_true, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1 = f1
             best_thresh = t
     return round(best_thresh, 2)
 
 
 def evaluate_model(name, model, X_te, y_te, threshold=None):
     """Evaluate a fitted model on test set, return metrics dict."""
-    y_proba = model.predict_proba(X_te)[:, 1]
-    thresh  = threshold if threshold is not None else find_best_threshold(y_te, y_proba)
-    y_pred  = (y_proba >= thresh).astype(int)
+    y_proba = model.predict_proba(X_te)[:, 1] if hasattr(model, "predict_proba") else model.predict(X_te)
+    thresh = threshold if threshold is not None else find_best_threshold(y_te, y_proba)
+    y_pred = (y_proba >= thresh).astype(int)
 
-    auc      = roc_auc_score(y_te, y_proba)
-    f1       = f1_score(y_te, y_pred, zero_division=0)
+    acc = accuracy_score(y_te, y_pred)
+    auc = roc_auc_score(y_te, y_proba)
+    f1 = f1_score(y_te, y_pred, zero_division=0)
     f1_macro = f1_score(y_te, y_pred, average="macro", zero_division=0)
-    accuracy = (y_pred == y_te).mean()
 
     print(f"\n{name} (threshold={thresh})")
-    print(f"  AUC: {auc:.4f}  Accuracy: {accuracy:.4f}  F1: {f1:.4f}  F1 Macro: {f1_macro:.4f}")
+    print(f"  Unique Predictions: {np.unique(y_pred)}")
+    print(f"  Accuracy: {acc * 100:.2f}%")
+    print(f"  AUC: {auc:.4f}  F1: {f1:.4f}  F1 Macro: {f1_macro:.4f}")
     print(classification_report(y_te, y_pred, target_names=['Good Credit', 'Bad Credit'], zero_division=0))
 
     return {
         "name": name, "model": model,
         "auc": auc, "f1": f1, "f1_macro": f1_macro,
-        "accuracy": accuracy, "y_pred": y_pred, "y_proba": y_proba,
+        "accuracy": acc, "y_pred": y_pred, "y_proba": y_proba,
     }
 
 
@@ -63,35 +73,15 @@ def print_comparison(results, title="Model Comparison"):
     """Print a side-by-side comparison table."""
     print(f"\n{title}")
     df = pd.DataFrame([{
-        "Model":    r["name"],
-        "AUC":      round(r["auc"], 4),
-        "Accuracy": f"{r['accuracy']*100:.1f}%",
-        "F1":       round(r["f1"], 4),
+        "Model": r["name"],
+        "Accuracy": f"{r['accuracy'] * 100:.2f}%",
+        "AUC": round(r["auc"], 4),
+        "F1": round(r["f1"], 4),
         "F1 Macro": round(r["f1_macro"], 4),
     } for r in results])
     print(df.to_string(index=False))
 
 
-def compare_predictions(champion_preds, challenger_preds):
-    """Compare champion vs challenger predictions. Returns (agreement_ratio, verdict)."""
-    total = len(champion_preds)
-    agree = int((champion_preds == challenger_preds).sum())
-    ratio = agree / total
-
-    print(f"\nPrediction Agreement: {agree}/{total} ({ratio:.1%})")
-    print(f"  Threshold: {AGREE_THRESHOLD:.0%}")
-
-    if ratio >= AGREE_THRESHOLD:
-        verdict = "STABLE"
-        print(f"  Verdict: STABLE — champion and challenger agree, champion stays")
-    else:
-        verdict = "INVALID"
-        print(f"  Verdict: INVALID — models diverge, switch to challenger")
-
-    return ratio, verdict
-
-
-# ── Load and preprocess German Credit data ──
 
 try:
     df_german = pd.read_csv(GERMAN_PATH)
@@ -111,7 +101,6 @@ try:
     if target_col is None:
         raise ValueError(f"No 'class' column found. Columns: {df_german.columns.tolist()}")
 
-    # Remap 1→0 (Good), 2→1 (Bad) if original encoding
     if df_german[target_col].isin([1, 2]).all():
         df_german[target_col] = (df_german[target_col] == 2).astype(int)
 
@@ -120,7 +109,6 @@ try:
     X_g = df_german.drop(target_col, axis=1).copy()
     y_g = df_german[target_col]
 
-    # Feature engineering — meaningful financial ratios
     if 'credit_amount' in X_g.columns and 'duration' in X_g.columns:
         X_g['credit_per_month'] = X_g['credit_amount'] / X_g['duration'].clip(lower=1)
     if 'credit_amount' in X_g.columns and 'age' in X_g.columns:
@@ -149,11 +137,11 @@ try:
         X_g_encoded, y_g, test_size=0.2, random_state=42, stratify=y_g
     )
 
-    scaler_g     = StandardScaler()
-    Xg_train_sc  = scaler_g.fit_transform(Xg_train)
-    Xg_test_sc   = scaler_g.transform(Xg_test)
+    scaler_g = StandardScaler()
+    Xg_train_sc = scaler_g.fit_transform(Xg_train)
+    Xg_test_sc = scaler_g.transform(Xg_test)
     yg_train_arr = yg_train.values
-    yg_test_arr  = yg_test.values
+    yg_test_arr = yg_test.values
 
     neg_g = (yg_train_arr == 0).sum()
     pos_g = (yg_train_arr == 1).sum()
@@ -167,47 +155,52 @@ except ValueError as e:
     raise SystemExit(1)
 
 
-# ── Load PSI drift results ──
+import mlflow
+from mlflow.tracking import MlflowClient
 
 try:
-    with open("drift_data.pkl", "rb") as f:
-        drift_data = pickle.load(f)
-
-    psi_results      = drift_data["psi_results"]
-    any_drift        = drift_data["any_drift"]
-    drifted_features = drift_data["drifted_features"]
-
-    print("PSI Results:")
-    for r in psi_results:
-        if r["psi"] > 0:
-            print(f"  {r['feature']:<40} {r['psi']:>8.4f}  {r['status']}")
-    print(f"  Drift detected: {'YES' if any_drift else 'NO'}\n")
-
-except FileNotFoundError:
-    print("drift_data.pkl not found — run drift_detection.py first.")
+    drift_runs = mlflow.search_runs(filter_string="tags.mlflow.runName = 'PSI_Drift_Detection'", order_by=["start_time DESC"], max_results=1)
+    if not drift_runs.empty:
+        any_drift = str(drift_runs.iloc[0].get("params.any_drift", "False")).lower() == "true"
+        drifted_features = str(drift_runs.iloc[0].get("params.drifted_features", ""))
+        print(f"Drift detected according to MLflow: {'YES' if any_drift else 'NO'}\n")
+    else:
+        print("No PSI_Drift_Detection run found in MLflow!")
+        any_drift = False
+        drifted_features = ""
+except Exception as e:
+    print(f"MLflow fetch error: {e}")
     raise SystemExit(1)
 
+try:
+    champ_runs = mlflow.search_runs(filter_string="tags.Champion = 'True'", order_by=["start_time DESC"], max_results=1)
+    if champ_runs.empty:
+        print("No Champion model found in MLflow!")
+        raise SystemExit(1)
+        
+    champ_run_id = champ_runs.iloc[0].run_id
+    champion_name = str(champ_runs.iloc[0].get("params.model_name", "Champion Model"))
+    
+    artifact_path = "xgboost_model" if "xgb" in champion_name.lower() else "sgd_model"
+    champion_model = mlflow.sklearn.load_model(f"runs:/{champ_run_id}/{artifact_path}")
+except Exception as e:
+    print(f"MLflow model load error: {e}")
+    raise SystemExit(1)
 
-# ── Champion model (XGBoost) — old model with pre-drift parameters ──
+from data_preprocess import get_home_credit_data
+_, X_hc_test, _, y_hc_test = get_home_credit_data()
 
-imbalance_g = neg_g / pos_g
+X_hc_eval = X_hc_test.copy()
+if any_drift:
+    X_hc_eval['AMT_INCOME_TOTAL'] *= 0.7
+    X_hc_eval['AMT_CREDIT'] *= 1.3
+    X_hc_eval['AMT_ANNUITY'] *= 1.2
 
-xgb_champion = XGBClassifier(
-    n_estimators=200, max_depth=5, learning_rate=0.05,
-    subsample=0.8, colsample_bytree=0.8,
-    scale_pos_weight=imbalance_g,
-    use_label_encoder=False, eval_metric="auc",
-    random_state=42, n_jobs=-1,
-)
-xgb_champion.fit(Xg_train_sc, yg_train_arr)
-champion_res = evaluate_model("XGBoost (Champion)", xgb_champion, Xg_test_sc, yg_test_arr, threshold=0.5)
+champion_res = evaluate_model(f"{champion_name} (Loaded Baseline)", champion_model, X_hc_eval, y_hc_test.values, threshold=0.5)
 
 
-# ── PSI-based model selection ──
-
-selected    = champion_res
-verdict     = "STABLE (no drift)"
-ratio       = 1.0
+selected = champion_res
+verdict = "NO DRIFT — champion stays"
 all_results = [champion_res]
 
 if not any_drift:
@@ -215,46 +208,66 @@ if not any_drift:
 
 else:
     print(f"\nDrift detected on: {drifted_features}")
-    print("Tuning challenger SVM (RandomizedSearchCV)...\n")
+    print("Retraining SGD challenger on drifted data...\n")
 
-    svm_search = RandomizedSearchCV(
-        SVC(probability=True, class_weight='balanced', random_state=42),
+    Xg_train_drifted = Xg_train.copy()
+    Xg_test_drifted = Xg_test.copy()
+
+    for df_ in [Xg_train_drifted, Xg_test_drifted]:
+        if 'credit_amount' in df_.columns:
+            df_['credit_amount'] *= 1.3
+        if 'installment_commitment' in df_.columns:
+            df_['installment_commitment'] *= 1.2
+
+       
+        if 'credit_per_month' in df_.columns:
+            df_['credit_per_month'] = df_['credit_amount'] / df_['duration'].clip(lower=1)
+        if 'credit_to_age' in df_.columns:
+            df_['credit_to_age'] = df_['credit_amount'] / df_['age'].clip(lower=1)
+        if 'total_commitment' in df_.columns:
+            df_['total_commitment'] = df_['installment_commitment'] * df_['duration']
+
+    scaler_new = StandardScaler()
+    Xg_train_drifted_sc = scaler_new.fit_transform(Xg_train_drifted)
+    Xg_test_drifted_sc = scaler_new.transform(Xg_test_drifted)
+    
+    print(f"Drifted training data: {Xg_train_drifted_sc.shape}")
+
+    from sklearn.linear_model import SGDClassifier
+    
+    
+    sgd_search = RandomizedSearchCV(
+        SGDClassifier(loss='log_loss', class_weight='balanced', random_state=42, max_iter=3000, tol=1e-3),
         param_distributions={
-            'kernel': ['rbf', 'poly'],
-            'C': [0.01, 0.1, 0.5, 1, 5, 10, 50, 100, 500],
-            'gamma': ['scale', 'auto', 0.001, 0.005, 0.01, 0.05, 0.1, 0.5],
-            'degree': [2, 3, 4],
+            'alpha': [1e-4, 1e-3, 1e-2, 1e-1, 1.0],
+            'penalty': ['l2', 'l1', 'elasticnet'],
+            'class_weight': ['balanced', None],
         },
-        n_iter=100, cv=5, scoring='accuracy',
+        n_iter=20, cv=5, scoring='accuracy',
         random_state=42, n_jobs=-1,
     )
-    svm_search.fit(Xg_train_sc, yg_train_arr)
-    print(f"Best params: {svm_search.best_params_}")
-    print(f"Best CV accuracy: {svm_search.best_score_:.4f}")
+    sgd_search.fit(Xg_train_drifted_sc, yg_train_arr)
+    print(f"Best params: {sgd_search.best_params_}")
+    print(f"Best CV accuracy: {sgd_search.best_score_:.4f}")
 
-    challenger_res = evaluate_model("SVM (Challenger)", svm_search.best_estimator_, Xg_test_sc, yg_test_arr)
+    challenger_res = evaluate_model("SGD (Challenger)", sgd_search.best_estimator_, Xg_test_drifted_sc, yg_test_arr)
 
-    ratio, verdict = compare_predictions(champion_res["y_pred"], challenger_res["y_pred"])
     all_results = [champion_res, challenger_res]
 
-    if verdict == "STABLE":
-        selected = champion_res
-    else:
-        selected = challenger_res
+    selected = challenger_res
+    verdict = "DRIFT DETECTED — switched to challenger"
 
 
-# ── Final output ──
 
 print_comparison(all_results, title="Final Comparison" + (" (Post-Drift)" if any_drift else ""))
 print(f"\nSelected model: {selected['name']} | Verdict: {verdict}")
 
-with open("german_credit_results.pkl", "wb") as f:
-    pickle.dump({
-        "all_results":    all_results,
-        "selected_model": selected["name"],
-        "verdict":        verdict,
-        "agree_ratio":    ratio,
-        "any_drift":      any_drift,
-    }, f)
-
-print("Saved german_credit_results.pkl")
+with mlflow.start_run(run_name="German_Credit_Evaluation") as run:
+    mlflow.log_param("selected_model", selected["name"])
+    mlflow.log_param("verdict", verdict)
+    mlflow.log_param("any_drift", any_drift)
+    mlflow.log_metric("final_auc", selected["auc"])
+    mlflow.log_metric("final_f1", selected["f1"])
+    mlflow.log_metric("final_accuracy", selected["accuracy"])
+    
+print("Logged final evaluation to MLflow.")

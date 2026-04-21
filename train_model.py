@@ -1,123 +1,126 @@
 """
-Model Training — XGBoost + SVM on Home Credit data.
-Saves trained_models.pkl for downstream drift detection and German Credit evaluation.
+Model Training — Baseline Models on Home Credit data.
+Uses scikit-learn Pipeline and MLflow tracking.
 """
 
-import pandas as pd
 import numpy as np
-from sklearn.linear_model import SGDClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.metrics import roc_auc_score, f1_score, classification_report
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from xgboost import XGBClassifier
-import pickle
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, classification_report, accuracy_score
+import mlflow
 
-with open("processed_data.pkl", "rb") as f:
-    data = pickle.load(f)
+import mlflow.sklearn
+from mlflow.tracking import MlflowClient
 
-X_train = data["X_train_scaled"]
-X_test  = data["X_test_scaled"]
-y_train = data["y_train"].values
-y_test  = data["y_test"].values
+from data_preprocess import get_home_credit_data, NUM_FEATURES, CAT_FEATURES
 
-neg = (y_train == 0).sum()
-pos = (y_train == 1).sum()
-imbalance_ratio = neg / pos
-
-print(f"No Default: {neg}, Default: {pos} (ratio {imbalance_ratio:.1f}:1)\n")
-
-
-def find_best_threshold(y_true, y_proba):
-    """Scan thresholds 0.1–0.9 and return the one with the best F1."""
-    best_thresh, best_f1 = 0.5, 0.0
-    for t in np.arange(0.1, 0.9, 0.01):
-        preds = (y_proba >= t).astype(int)
-        f1 = f1_score(y_true, preds, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thresh = t
-    return round(best_thresh, 2), round(best_f1, 4)
-
-
-def evaluate_model(name, model, X_tr, y_tr, X_te, y_te, use_threshold_tuning=True):
-    """Fit model, evaluate on test set, print report."""
-    model.fit(X_tr, y_tr)
-    y_proba = model.predict_proba(X_te)[:, 1]
-
-    if use_threshold_tuning:
-        best_thresh, _ = find_best_threshold(y_te, y_proba)
-        y_pred = (y_proba >= best_thresh).astype(int)
-    else:
-        best_thresh = 0.5
-        y_pred = model.predict(X_te)
-
-    auc      = roc_auc_score(y_te, y_proba)
-    f1       = f1_score(y_te, y_pred, zero_division=0)
-    f1_macro = f1_score(y_te, y_pred, average="macro", zero_division=0)
-    accuracy = (y_pred == y_te).mean()
-
-    print(f"{name} (threshold={best_thresh})")
-    print(f"  AUC: {auc:.4f}  Accuracy: {accuracy:.4f}  F1: {f1:.4f}  F1 Macro: {f1_macro:.4f}")
-    print(classification_report(y_te, y_pred, target_names=['No Default', 'Default'], zero_division=0))
-
+def evaluate_and_log_pipeline(name, pipeline, X_tr, y_tr, X_te, y_te):
+    """Fit pipeline, evaluate on test set, print report, and log strictly to MLflow."""
+    with mlflow.start_run(run_name=name) as run:
+        print(f"\nTraining {name}...")
+        pipeline.fit(X_tr, y_tr)
+        
+        y_pred = pipeline.predict(X_te)
+        y_proba = pipeline.predict_proba(X_te)[:, 1] if hasattr(pipeline, "predict_proba") else y_pred
+        
+        acc = accuracy_score(y_te, y_pred)
+        prec = precision_score(y_te, y_pred, zero_division=0)
+        rec = recall_score(y_te, y_pred, zero_division=0)
+        f1 = f1_score(y_te, y_pred, zero_division=0)
+        auc = roc_auc_score(y_te, y_proba)
+        
+        print(f"{name} Results:")
+        print(f"  Unique Predictions: {np.unique(y_pred)}")
+        print(f"  Accuracy:  {acc * 100:.2f}%")
+        print(f"  Precision: {prec:.4f}")
+        print(f"  Recall:    {rec:.4f}")
+        print(f"  F1 Score:  {f1:.4f}")
+        print(f"  AUC:       {auc:.4f}")
+        print(classification_report(y_te, y_pred, target_names=["No Default", "Default"], zero_division=0))
+        
+        mlflow.log_params({
+            "model_name": name,
+            "pipeline_steps": str([step[0] for step in pipeline.steps])
+        })
+        
+        mlflow.log_metrics({
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "auc": auc
+        })
+        
+        model_name = f"{name.lower()}_model"
+        if "sgd" in model_name or "svm" in model_name: 
+            model_name = "sgd_model"  
+        mlflow.sklearn.log_model(
+            sk_model=pipeline, 
+            name=model_name, 
+            serialization_format="skops",
+            skops_trusted_types=["numpy.dtype", "xgboost.core.Booster", "xgboost.sklearn.XGBClassifier"]
+        )
+        
+        run_id = run.info.run_id
+    
     return {
-        "name":     name,
-        "model":    model,
-        "auc":      auc,
-        "f1":       f1,
-        "f1_macro": f1_macro,
-        "accuracy": accuracy,
+        "name": name,
+        "auc": auc,
+        "run_id": run_id
     }
 
-
-# XGBoost — Champion
-xgb = XGBClassifier(
-    n_estimators=300, max_depth=5, learning_rate=0.05,
-    subsample=0.8, colsample_bytree=0.8,
-    scale_pos_weight=imbalance_ratio,
-    use_label_encoder=False, eval_metric="auc",
-    random_state=42, n_jobs=-1,
-)
-xgb_result = evaluate_model("XGBoost", xgb, X_train, y_train, X_test, y_test)
-
-# SVM — Challenger (SGD with hinge loss for speed)
-sgd = SGDClassifier(
-    loss="hinge", class_weight="balanced",
-    max_iter=1000, random_state=42, n_jobs=-1,
-)
-svm = CalibratedClassifierCV(sgd, cv=3)
-svm_result = evaluate_model("SVM (SGD)", svm, X_train, y_train, X_test, y_test)
-
-X_train_svm = X_train
-y_train_svm = y_train
-
-# Comparison
-results = [xgb_result, svm_result]
-
-comparison_df = pd.DataFrame([{
-    "Model":    r["name"],
-    "AUC":      round(r["auc"], 4),
-    "Accuracy": f"{r['accuracy']*100:.1f}%",
-    "F1":       round(r["f1"], 4),
-    "F1 Macro": round(r["f1_macro"], 4),
-} for r in results])
-print(comparison_df.to_string(index=False))
-
-best_auc = max(results, key=lambda x: x["auc"])
-best_f1  = max(results, key=lambda x: x["f1"])
-print(f"\nChampion (AUC): {best_auc['name']} AUC={best_auc['auc']:.4f}")
-print(f"Best F1:        {best_f1['name']}  F1={best_f1['f1']:.4f}")
-
-with open("trained_models.pkl", "wb") as f:
-    pickle.dump({
-        "results":         results,
-        "xgb_result":      xgb_result,
-        "svm_result":      svm_result,
-        "best_model_name": best_auc["name"],
-        "champion":        best_auc,
-        "X_train_svm":     X_train_svm,
-        "y_train_svm":     y_train_svm,
-    }, f)
-
-print("\nSaved trained_models.pkl")
+if __name__ == "__main__":
+    X_train, X_test, y_train, y_test = get_home_credit_data()
+    
+    
+    imbalance_ratio = (y_train == 0).sum() / (y_train == 1).sum()
+    
+    
+    numeric_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+    
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", OneHotEncoder(handle_unknown="ignore"))
+    ])
+    
+    preprocessor = ColumnTransformer(transformers=[
+        ("num", numeric_transformer, NUM_FEATURES),
+        ("cat", categorical_transformer, CAT_FEATURES)
+    ])
+    
+    xgb_pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", XGBClassifier(
+            use_label_encoder=False, eval_metric="auc", 
+            scale_pos_weight=imbalance_ratio, random_state=42, n_jobs=-1
+        ))
+    ])
+    
+    sgd_pipeline = Pipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("classifier", SGDClassifier(
+            loss="log_loss",
+            class_weight="balanced",
+            max_iter=3000,
+            tol=1e-3,
+            random_state=42
+        ))
+    ])
+    
+    results = []
+    results.append(evaluate_and_log_pipeline("XGBoost", xgb_pipeline, X_train, y_train, X_test, y_test))
+    results.append(evaluate_and_log_pipeline("SGD", sgd_pipeline, X_train, y_train, X_test, y_test))
+    
+    best_model = max(results, key=lambda x: x["auc"])
+    print(f"\nChampion Model: {best_model['name']} with AUC={best_model['auc']:.4f}")
+    
+    client = MlflowClient()
+    client.set_tag(best_model["run_id"], "Champion", "True")
