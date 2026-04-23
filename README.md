@@ -90,3 +90,11 @@ pip install xgboost scikit-learn mlflow pandas numpy matplotlib
 - **German Credit as drift batch only** — Home Credit is never modified; German Credit is the incoming production distribution.
 - **Challenger trained only on drift** — if PSI < 0.20 for all features, the pipeline exits after Champion evaluation with no unnecessary retraining.
 - **AUC-ROC plot** — saved as `roc_curves.png` and logged as an MLflow artifact. Shows both Champion and Challenger curves when drift is detected and a Challenger is trained; shows the Champion curve only otherwise.
+  
+## 🚀 Future Improvements
+
+- Integrate real-time streaming data for continuous drift monitoring  
+- Support additional drift detection techniques (KS test, KL divergence)  
+- Extend pipeline to handle multi-model ensembles beyond XGBoost  
+- Automate deployment using CI/CD pipelines with MLflow Model Registry  
+- Add dashboard visualization for drift metrics and model performance  
