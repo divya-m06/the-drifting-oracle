@@ -90,7 +90,14 @@ pip install xgboost scikit-learn mlflow pandas numpy matplotlib
 - **German Credit as drift batch only** — Home Credit is never modified; German Credit is the incoming production distribution.
 - **Challenger trained only on drift** — if PSI < 0.20 for all features, the pipeline exits after Champion evaluation with no unnecessary retraining.
 - **AUC-ROC plot** — saved as `roc_curves.png` and logged as an MLflow artifact. Shows both Champion and Challenger curves when drift is detected and a Challenger is trained; shows the Champion curve only otherwise.
-  
+
+## 📌 Use Cases
+
+- Credit scoring systems in changing economic conditions  
+- Fraud detection models affected by shifting user behavior  
+- Production ML systems requiring continuous monitoring and retraining  
+- Financial risk modeling under dynamic market environments  
+
 ## 🚀 Future Improvements
 
 - Integrate real-time streaming data for continuous drift monitoring  
